@@ -23,6 +23,13 @@
 #include <stdint.h>
 #include <sys/time.h>
 #include <stack>
+#include <netinet/in.h>
+#include <sys/un.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/wait.h>
 extern "C" {
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -40,17 +47,18 @@ ZEND_DECLARE_MODULE_GLOBALS(cop)
 /* True global resources - no need for thread safety here */
 using namespace std;
 static int le_cop;
-long counter;
+ZEND_DECLARE_MODULE_GLOBALS(cop)
 struct task_t
 {
         stCoRoutine_t *co;
         zval *callback;
         zval *arg;
-        zval *retval;
-        int fd;
+        zval retval;
+        long fd;
 };
 
 static stack<task_t*> g_readwrite;
+static stack<task_t*> g_data;
 
 ZEND_BEGIN_ARG_INFO_EX(cop_create_arginfo, 0, 0, 1)
     ZEND_ARG_INFO(0,callback)
@@ -73,62 +81,150 @@ PHP_INI_END()
 /* Every user-visible function in PHP should document itself in the source */
 /* {{{ proto string confirm_cop_compiled(string arg)
    Return a string to confirm that the module is compiled in */
-
+ static void php_cop_init_globals(zend_cop_globals *cop_globals)
+{
+    cop_globals->counter = 0;
+}
 
 void *cop_routine(void *arg){
 	co_enable_hook_sys(); 
-	zval retval;
 	task_t *co = (task_t*)arg;
-    if (call_user_function_ex(EG(function_table), NULL, co->callback,&retval,1,co->arg,0,NULL) != SUCCESS)
+    if (call_user_function_ex(EG(function_table), NULL, co->callback,&(co->retval),1,co->arg,0,NULL) != SUCCESS)
     {
     	php_error_docref(NULL TSRMLS_CC, E_WARNING, "参数不正确!!!");
     	co->fd=-1;
     }
-    *(co->retval)=retval;
-    g_readwrite.push(co);
     if( -1 == co->fd )
     {
       co_yield_ct();
     }
-    co_resume(co->co);
+}
+/*
+void *cop_routine(void *arg){
+	co_enable_hook_sys(); 
+	char buffer[]={'x','y','z'};
+	FILE *fp = fopen("/server/cop/da.txt","a+");
+	fwrite(buffer,sizeof(buffer),1,fp);
+	task_t *co = (task_t*)arg;
+	char buf[ 1024 * 16 ];
+	for(;;)
+    {
+		if( -1 == co->fd )
+		{
+			g_readwrite.push( co );
+			co_yield_ct();
+			continue;
+	    }
+	    int fd = co->fd;
+		co->fd = -1;
+		for(;;)
+		{
+			struct pollfd pf = { 0 };
+			pf.fd = fd;
+			pf.events = (POLLIN|POLLERR|POLLHUP);
+			co_poll( co_get_epoll_ct(),&pf,1,1000);
+			int ret = read( fd,buf,sizeof(buf) );
+			if( ret > 0 )
+			{
+				
+				if (call_user_function_ex(EG(function_table), NULL, co->callback,&(co->retval),1,co->arg,0,NULL) != SUCCESS)
+    			{
+    				php_error_docref(NULL TSRMLS_CC, E_WARNING, "参数不正确!!!");
+    			}
+    			
+			}
+			if( ret <= 0 )
+			{
+				// accept_routine->SetNonBlock(fd) cause EAGAIN, we should continue
+				if (errno == EAGAIN)
+					continue;
+				//close( fd );
+				break;
+			}
+		}
+	}
+	fclose(fp);
 }
 
+void *cop_accept_routine( void * )
+{
+	co_enable_hook_sys();
+	for(;;)
+	{
+		if( g_readwrite.empty() )
+		{
+			struct pollfd pf = { 0 };
+			pf.fd = -1;
+			poll( &pf,1,1000);
+			continue;
+		}
+		if( g_data.empty() )
+		{
+			continue;
+		}
+		task_t *rco = g_data.top();
+		int fd = rco->fd;
+		if( fd < 0 )
+		{
+			struct pollfd pf = { 0 };
+			pf.fd = -1;
+			pf.events = (POLLIN|POLLERR|POLLHUP);
+			co_poll( co_get_epoll_ct(),&pf,1,1000 );
+			continue;
+		}
+		g_data.pop();
+		if( g_readwrite.empty() )
+		{
+			continue;
+		}
+		task_t *co = g_readwrite.top();
+		co->fd = fd;
+		g_readwrite.pop();
+		co_resume( co->co );
+	}
+}
+
+*/
 
 PHP_FUNCTION(cop_create)
 {
 	zval *callback;
 	zval *arg = NULL;
 	task_t *co;
-	long fd;
 	if (zend_parse_parameters(ZEND_NUM_ARGS(), "z|z",&callback,&arg) == FAILURE) {
 		php_error_docref(NULL TSRMLS_CC, E_WARNING, "参数不正确!!!");
         RETURN_FALSE;
 	}
-	counter++;
-	fd=counter;
+	COP_G(counter)++;
     task_t * task = (task_t*)calloc( 1,sizeof(task_t) );
-    task->fd = fd;
+    task->fd = COP_G(counter);
     task->callback=callback;
     task->arg=arg;
-    // cop_routine(task);
     co_create(&(task->co),NULL,cop_routine,task);
     co_resume(task->co);
-    co_eventloop( co_get_epoll_ct(),0,0 );
-    for(;;)
-    {
-	    if(g_readwrite.empty()){
-	    }else{
-	    	co=(task_t*)g_readwrite.top();
-	    	if(co->fd==fd){
-	    		g_readwrite.pop();
-	    		return_value = co->retval;
-	     		zval_copy_ctor(return_value);
-	     		break;
-	    	}
-	    } 
-	}
-    RETURN_TRUE;
+   RETURN_TRUE;
 }
+/*
+PHP_FUNCTION(cop_create)
+{
+	zval *callback;
+	zval *arg = NULL;
+	task_t *co;
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "z|z",&callback,&arg) == FAILURE) {
+		php_error_docref(NULL TSRMLS_CC, E_WARNING, "参数不正确!!!");
+        RETURN_FALSE;
+	}
+	COP_G(counter)++;
+    task_t * task = (task_t*)calloc( 1,sizeof(task_t) );
+    task->fd =COP_G(counter);
+    task->callback=callback;
+    task->arg=arg;
+    g_data.push(task);
+    printf("test:%d!\n",g_data.size());
+    //co_resume(task->co);
+   RETURN_TRUE;
+}
+*/
 /* }}} */
 /* The previous line is meant for vim and emacs, so it can correctly fold and
    unfold functions in source code. See the corresponding marks just before
@@ -155,6 +251,19 @@ PHP_MINIT_FUNCTION(cop)
 	/* If you have INI entries, uncomment these lines
 	REGISTER_INI_ENTRIES();
 	*/
+/*
+	for (int i = 0; i < 10; ++i)
+	{
+		task_t * task = (task_t*)calloc( 1,sizeof(task_t) );
+		task->fd=-1;
+		co_create(&(task->co),NULL,cop_routine,task);
+    	co_resume(task->co);
+	}
+	stCoRoutine_t *accept_co = NULL;
+	co_create( &accept_co,NULL,cop_accept_routine,0 );
+	co_resume( accept_co );
+
+	co_eventloop( co_get_epoll_ct(),0,0 );*/
 	return SUCCESS;
 }
 /* }}} */

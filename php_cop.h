@@ -37,7 +37,9 @@ extern zend_module_entry cop_module_entry;
 #ifdef ZTS
 #include "TSRM.h"
 #endif
-
+ZEND_BEGIN_MODULE_GLOBALS(cop)
+  long  counter;
+ZEND_END_MODULE_GLOBALS(cop)
 /*
   	Declare any global variables you may need between the BEGIN
 	and END macros here:
